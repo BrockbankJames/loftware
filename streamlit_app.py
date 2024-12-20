@@ -124,11 +124,8 @@ def get_embeddings_by_type(embedding_type):
     conn.close()
     return [(row[0], pickle.loads(row[1]), row[2], row[3]) for row in results]
 
-import requests
-from bs4 import BeautifulSoup
-
 def scrape_and_split_content(url):
-    """Scrape webpage and split content by headers"""
+    """Scrape webpage and split content by individual tags"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
@@ -141,48 +138,129 @@ def scrape_and_split_content(url):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Remove <script>, <style>, and <nav> elements
-        for element in soup.find_all(['script', 'style', 'nav']):
+        # Remove unwanted elements
+        for element in soup(['script', 'style', 'header', 'nav', 'footer', 'form', 'button']):
             element.decompose()
-        
-        # Remove the element with id 'headercontent'
-        header_content = soup.find(id='headercontent')
-        if header_content:
-            header_content.decompose()
             
         sections = []
-        current_section = {"title": "", "content": []}
+        seen_content = set()
         
-        main_content = soup.find('body')
+        # Find main content area
+        main_content = soup.find(['main', 'article', '[role="main"]']) or soup.find('body')
+        
         if main_content:
-            elements = main_content.find_all(['h1', 'h2', 'h3', 'p'])
-            
-            for element in elements:
-                if element.name in ['h1', 'h2', 'h3']:
-                    if current_section["content"]:
+            # Process headings first
+            for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                for element in main_content.find_all(tag, recursive=True):
+                    text = ' '.join(element.stripped_strings)
+                    if text and len(text) > 5 and text not in seen_content:
                         sections.append({
-                            "title": current_section["title"],
-                            "content": " ".join(current_section["content"])
+                            "title": f"{tag.upper()}: {text}",
+                            "content": text,
+                            "tag_type": tag.upper()
                         })
-                    current_section = {
-                        "title": element.get_text(strip=True),
-                        "content": []
-                    }
-                elif element.name == 'p':
-                    text = element.get_text(strip=True)
-                    if text:
-                        current_section["content"].append(text)
+                        seen_content.add(text)
             
-            if current_section["content"]:
-                sections.append({
-                    "title": current_section["title"],
-                    "content": " ".join(current_section["content"])
-                })
+            # Process paragraphs
+            for p in main_content.find_all('p', recursive=True):
+                # Skip if parent is a div we'll process later
+                if p.parent.name != 'div':
+                    text = ' '.join(p.stripped_strings)
+                    if text and len(text) > 5 and text not in seen_content:
+                        sections.append({
+                            "title": f"P: {text[:50]}...",
+                            "content": text,
+                            "tag_type": "P"
+                        })
+                        seen_content.add(text)
+            
+            # Process divs last, only if they contain direct text
+            for div in main_content.find_all('div', recursive=False):  # Only top-level divs
+                # Get only direct text content
+                direct_text = ' '.join(t for t in div.strings 
+                                     if t.parent == div and t.strip())
                 
+                if direct_text and len(direct_text) > 5 and direct_text not in seen_content:
+                    sections.append({
+                        "title": f"DIV: {direct_text[:50]}...",
+                        "content": direct_text,
+                        "tag_type": "DIV"
+                    })
+                    seen_content.add(direct_text)
+        
         return sections
     except Exception as e:
         raise Exception(f"Error scraping URL: {str(e)}")
 
+def show_full_analysis(keyword_text, url, keyword_embedding, url_embs, overall_similarity):
+    """Show detailed analysis of similarities"""
+    st.write("---")
+    st.subheader("Detailed Section Analysis")
+    
+    section_similarities = []
+    
+    for keyword, embedding, timestamp in url_embs:
+        section_norm = np.linalg.norm(embedding)
+        if section_norm > 0:
+            normalized_section_embedding = embedding / section_norm
+        else:
+            normalized_section_embedding = embedding
+        
+        keyword_norm = np.linalg.norm(keyword_embedding)
+        if keyword_norm > 0:
+            normalized_keyword_embedding = keyword_embedding / keyword_norm
+        else:
+            normalized_keyword_embedding = keyword_embedding
+        
+        similarity = np.dot(normalized_keyword_embedding, normalized_section_embedding)
+        section_similarities.append({
+            'Section': keyword.split('(URL:')[0],
+            'Similarity': similarity
+        })
+    
+    # Convert to DataFrame and sort by similarity
+    df = pd.DataFrame(section_similarities)
+    df = df.sort_values('Similarity', ascending=False)
+    
+    # Format similarity scores
+    df['Similarity'] = df['Similarity'].apply(lambda x: f"{x:.4f}")
+    
+    # Display the table with full width
+    st.write("Section-by-Section Similarity Scores:")
+    st.dataframe(
+        df,
+        use_container_width=True,  # This makes it full width
+        hide_index=True  # This hides the index column
+    )
+    
+    # Rest of the analysis code...
+    st.write("---")
+    st.write("### Overall Analysis")
+    st.write(f"**Keyword:** {keyword_text}")
+    st.write(f"**URL:** {url}")
+    st.write(f"**Overall Similarity Score:** {overall_similarity:.4f}")
+    
+    # Create downloadable analysis
+    analysis_json = {
+        "keyword": keyword_text,
+        "url": url,
+        "overall_similarity": overall_similarity,
+        "sections": [
+            {
+                "section": row['Section'],
+                "similarity": row['Similarity']
+            }
+            for _, row in df.iterrows()
+        ]
+    }
+    
+    json_str = json.dumps(analysis_json, indent=2)
+    st.download_button(
+        label="Download Analysis (JSON)",
+        data=json_str,
+        file_name=f"similarity_analysis_{keyword_text}_{url}.json",
+        mime="application/json"
+    )
 
 def check_and_migrate_database():
     """Check if database needs migration and perform if necessary"""
@@ -225,7 +303,7 @@ def check_and_migrate_database():
 check_and_migrate_database()
 
 # Streamlit app
-st.title("VectorRank by Digitaloft")
+st.title("Embedding Generator")
 
 # Create tabs
 tab1, tab2, tab3, tab4 = st.tabs(["Generate Embedding", "URL Content Embeddings", "Manage Database", "Compare Embeddings"])
@@ -275,256 +353,91 @@ with tab1:
 
     if st.session_state.current_embedding is not None:
         if st.button("Save to Database"):
-            save_to_sqlite(keyword, st.session_state.current_embedding, "keyword")
-
-    st.subheader("Saved Keyword Embeddings")
-    keyword_embeddings = get_embeddings_by_type("keyword")
-    
-    if keyword_embeddings:
-        st.write(f"Found {len(keyword_embeddings)} saved keyword embeddings")
-        
-        keyword_embeddings.sort(key=lambda x: x[3], reverse=True)
-        
-        for keyword, embedding, embedding_type, timestamp in keyword_embeddings:
-            with st.expander(f"📌 {keyword}"):
-                st.write(f"Created: {timestamp}")
-                st.code(str(embedding), language='python')
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    df = pd.DataFrame([embedding])
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv,
-                        file_name=f"{keyword}_embedding.csv",
-                        mime="text/csv",
-                        key=f"csv_keyword_{keyword}"
-                    )
-                with col2:
-                    json_data = json.dumps({
-                        "keyword": keyword,
-                        "embedding": embedding
-                    })
-                    st.download_button(
-                        label="Download JSON",
-                        data=json_data,
-                        file_name=f"{keyword}_embedding.json",
-                        mime="application/json",
-                        key=f"json_keyword_{keyword}"
-                    )
-                with col3:
-                    if st.button("Delete", key=f"delete_keyword_{keyword}"):
-                        delete_from_sqlite(keyword)
-                        st.rerun()
-    else:
-        st.write("No keyword embeddings saved yet.")
+            save_to_sqlite(keyword, st.session_state.current_embedding)
+            st.session_state.current_embedding = None
 
 with tab2:
-    st.write("Generate embeddings from webpage content")
+    st.write("Enter a URL to generate embeddings for its content sections.")
     url = st.text_input("Enter URL:")
     
     if st.button("Scrape and Generate Embeddings"):
         if url:
             try:
-                with st.spinner("Scraping webpage..."):
-                    sections = scrape_and_split_content(url)
-                
-                st.success(f"Found {len(sections)} sections")
-                
-                st.session_state.sections = sections
-                st.session_state.url = url
-                
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-        else:
-            st.warning("Please enter a URL")
-    
-    if hasattr(st.session_state, 'sections'):
-        if st.button("Generate All Embeddings"):
-            try:
-                with st.spinner("Generating embeddings for all sections..."):
-                    for i, section in enumerate(st.session_state.sections):
+                sections = scrape_and_split_content(url)
+                if sections:
+                    st.success(f"Found {len(sections)} content sections!")
+                    
+                    # Store sections and URL in session state
+                    st.session_state['current_sections'] = sections
+                    st.session_state['current_url'] = url
+                    
+                    # Generate all embeddings first
+                    all_embeddings = []
+                    for section in sections:
                         response = client.embeddings.create(
                             model="text-embedding-ada-002",
                             input=section['content']
                         )
-                        embedding = response.data[0].embedding
-                        st.session_state[f'embedding_{i}'] = embedding
-                    st.success("Generated embeddings for all sections!")
-            except Exception as e:
-                st.error(f"Error generating embeddings: {str(e)}")
-
-        if st.button("Save All Embeddings"):
-            try:
-                saved_count = 0
-                for i, section in enumerate(st.session_state.sections):
-                    if f'embedding_{i}' in st.session_state:
-                        save_to_sqlite(
-                            f"{section['title']} (URL: {st.session_state.url})",
-                            st.session_state[f'embedding_{i}'],
-                            "url"
-                        )
-                        saved_count += 1
-                if saved_count > 0:
-                    st.success(f"Saved {saved_count} embeddings to database!")
-                else:
-                    st.warning("No embeddings to save. Generate embeddings first.")
-            except Exception as e:
-                st.error(f"Error saving embeddings: {str(e)}")
-
-        for i, section in enumerate(st.session_state.sections):
-            with st.expander(f"Section {i+1}: {section['title']}"):
-                st.write("Content preview:")
-                st.write(section['content'][:200] + "...")
-                
-                generate_key = f"generate_{i}"
-                if st.button("Generate Embedding", key=generate_key):
-                    try:
-                        response = client.embeddings.create(
-                            model="text-embedding-ada-002",
-                            input=section['content']
-                        )
-                        embedding = response.data[0].embedding
-                        st.session_state[f'embedding_{i}'] = embedding
-                        
-                        st.write("Embedding vector:")
-                        st.code(str(embedding), language='python')
-                        
-                        col1, col2, col3 = st.columns([2, 2, 2])
-                        
-                        with col1:
+                        all_embeddings.append(response.data[0].embedding)
+                    
+                    # Store embeddings in session state
+                    st.session_state['current_embeddings'] = all_embeddings
+                    
+                    # Display individual sections
+                    for i, (section, embedding) in enumerate(zip(sections, all_embeddings)):
+                        with st.expander(f"Section {i+1}: {section['title']}"):
+                            st.write("Content:")
+                            st.write(section['content'])
+                            st.write("Embedding generated successfully!")
+                            
+                            url_keyword = f"{section['title']} (URL: {url})"
+                            
                             if st.button("Save to Database", key=f"save_{i}"):
-                                save_to_sqlite(
-                                    f"{section['title']} (URL: {st.session_state.url})", 
-                                    embedding,
-                                    "url"
-                                )
-                        
-                        with col2:
-                            df = pd.DataFrame([embedding])
-                            csv = df.to_csv(index=False).encode('utf-8')
-                            st.download_button(
-                                label="Download CSV",
-                                data=csv,
-                                file_name=f"section_{i+1}_embedding.csv",
-                                mime="text/csv",
-                                key=f"csv_section_{i}"
-                            )
-                        
-                        with col3:
-                            json_data = json.dumps({
-                                "title": section['title'],
-                                "url": st.session_state.url,
-                                "embedding": embedding
-                            })
-                            st.download_button(
-                                label="Download JSON",
-                                data=json_data,
-                                file_name=f"section_{i+1}_embedding.json",
-                                mime="application/json",
-                                key=f"json_section_{i}"
-                            )
-                    
-                    except Exception as e:
-                        st.error(f"Error generating embedding: {str(e)}")
-                
-                if f'embedding_{i}' in st.session_state:
-                    st.write("Existing embedding:")
-                    st.code(str(st.session_state[f'embedding_{i}']), language='python')
-
-    st.subheader("Saved URL Embeddings")
-    url_embeddings = get_embeddings_by_type("url")
-    
-    if url_embeddings:
-        st.write(f"Found {len(url_embeddings)} saved URL embeddings")
-        
-        url_groups = {}
-        for keyword, embedding, embedding_type, timestamp in url_embeddings:
-            url_part = keyword.split("URL: ")[-1].strip(")")
-            if url_part not in url_groups:
-                url_groups[url_part] = []
-            url_groups[url_part].append((keyword, embedding, timestamp))
-        
-        for url_key, embeddings in url_groups.items():
-            with st.expander(f"📌 {url_key}"):
-                st.write(f"**{len(embeddings)} sections**")
-                
-                embeddings_array = np.vstack([emb[1] for emb in embeddings])
-                average_embedding = np.mean(embeddings_array, axis=0)
-                
-                norm = np.linalg.norm(average_embedding)
-                if norm > 0:
-                    normalized_average_embedding = average_embedding / norm
+                                try:
+                                    save_to_sqlite(url_keyword, embedding, embedding_type="url")
+                                    st.success(f"Successfully saved section {i+1} to database!")
+                                except Exception as save_error:
+                                    st.error(f"Error saving to database: {save_error}")
+                            
+                            st.write(f"Embedding length: {len(embedding)}")
                 else:
-                    normalized_average_embedding = average_embedding
-                
-                st.write("**Average Embedding (Normalized):**")
-                st.code(str(normalized_average_embedding), language='python')
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    df = pd.DataFrame([normalized_average_embedding])
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Download Average (CSV)",
-                        data=csv,
-                        file_name=f"{url_key}_average_embedding.csv",
-                        mime="text/csv",
-                        key=f"csv_avg_{url_key}"
-                    )
-                with col2:
-                    json_data = json.dumps({
-                        "url": url_key,
-                        "average_embedding": normalized_average_embedding.tolist()
-                    })
-                    st.download_button(
-                        label="Download Average (JSON)",
-                        data=json_data,
-                        file_name=f"{url_key}_average_embedding.json",
-                        mime="application/json",
-                        key=f"json_avg_{url_key}"
-                    )
-                
-                st.write("---")
-                st.write("**Individual Section Embeddings:**")
-                
-                for i, (keyword, embedding, timestamp) in enumerate(embeddings):
-                    st.write("---")
-                    st.write(f"**Section {i+1}:** {keyword.split('(URL:')[0]}")
-                    st.write(f"Created: {timestamp}")
-                    st.code(str(embedding), language='python')
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        df = pd.DataFrame([embedding])
-                        csv = df.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            label="Download CSV",
-                            data=csv,
-                            file_name=f"section_{i+1}_embedding.csv",
-                            mime="text/csv",
-                            key=f"csv_url_{url_key}_{i}"
-                        )
-                    with col2:
-                        json_data = json.dumps({
-                            "title": keyword,
-                            "url": url_key,
-                            "embedding": embedding
-                        })
-                        st.download_button(
-                            label="Download JSON",
-                            data=json_data,
-                            file_name=f"section_{i+1}_embedding.json",
-                            mime="application/json",
-                            key=f"json_url_{url_key}_{i}"
-                        )
-                    with col3:
-                        if st.button("Delete", key=f"delete_url_{url_key}_{i}"):
-                            delete_from_sqlite(keyword)
-                            st.rerun()
-    else:
-        st.write("No URL embeddings saved yet.")
+                    st.warning("No content sections found on the page.")
+            except Exception as e:
+                st.error(f"Error processing URL: {e}")
+        else:
+            st.warning("Please enter a URL.")
+
+    # Add Save All button outside the if statement
+    if 'current_sections' in st.session_state and 'current_embeddings' in st.session_state:
+        if st.button("Save All Sections to Database", key="save_all"):
+            try:
+                for section, embedding in zip(st.session_state['current_sections'], 
+                                           st.session_state['current_embeddings']):
+                    url_keyword = f"{section['title']} (URL: {st.session_state['current_url']})"
+                    save_to_sqlite(url_keyword, embedding, embedding_type="url")
+                st.success("All sections saved successfully!")
+                st.rerun()
+            except Exception as save_all_error:
+                st.error(f"Error saving all sections: {save_all_error}")
+
+        # Display saved embeddings
+    st.subheader("Saved URL Embeddings")
+    try:
+        url_embeddings = get_embeddings_by_type("url")
+        st.write(f"Found {len(url_embeddings)} saved embeddings")
+        
+        if url_embeddings:
+            for i, (keyword, embedding, embedding_type, _) in enumerate(url_embeddings):
+                with st.expander(f"📄 {keyword}"):
+                    st.write(f"Embedding type: {embedding_type}")
+                    st.write(f"Embedding length: {len(embedding)}")
+                    if st.button("Delete", key=f"delete_saved_{i}"):
+                        delete_from_sqlite(keyword)
+                        st.rerun()
+        else:
+            st.write("No URL embeddings saved yet.")
+    except Exception as load_error:
+        st.error(f"Error loading saved embeddings: {load_error}")
 
 with tab3:
     st.subheader("Manage Saved Embeddings")
@@ -651,22 +564,27 @@ with tab4:
             else:
                 normalized_keyword_embedding = keyword_embedding
             
-            similarity = np.dot(normalized_keyword_embedding, normalized_url_embedding)
+            overall_similarity = np.dot(normalized_keyword_embedding, normalized_url_embedding)
             
-            st.write("**Cosine Similarity Score:**")
-            st.write(f"{similarity:.4f}")
+            st.write("**Overall Cosine Similarity Score:**")
+            st.write(f"{overall_similarity:.4f}")
             
-            save_similarity(selected_keyword, selected_url, similarity)
-        
-        st.subheader("Saved Similarity Scores")
-        similarities = get_all_similarities()
-        
-        if similarities:
-            for keyword_text, url, score, timestamp in similarities:
-                with st.expander(f"📊 {keyword_text} vs {url}"):
-                    st.write(f"**Score:** {score:.4f}")
-                    st.write(f"**Calculated:** {timestamp}")
-                    
+            save_similarity(selected_keyword, selected_url, overall_similarity)
+            
+            show_full_analysis(selected_keyword, selected_url, keyword_embedding, url_embs, overall_similarity)
+
+    st.subheader("Saved Similarity Scores")
+    similarities = get_all_similarities()
+    
+    if similarities:
+        for keyword_text, url, score, timestamp in similarities:
+            with st.expander(f"📊 {keyword_text} vs {url}"):
+                st.write(f"**Score:** {score:.4f}")
+                st.write(f"**Calculated:** {timestamp}")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
                     if st.button("Delete", key=f"delete_sim_{keyword_text}_{url}"):
                         conn = setup_similarity_table()
                         cursor = conn.cursor()
@@ -675,7 +593,11 @@ with tab4:
                         conn.commit()
                         conn.close()
                         st.rerun()
-        else:
-            st.write("No similarity scores saved yet.")
+                
+                with col2:
+                    if st.button("See Full Analysis", key=f"analysis_{keyword_text}_{url}"):
+                        keyword_embedding = next(emb[1] for emb in keyword_embeddings if emb[0] == keyword_text)
+                        url_embs = url_groups[url]
+                        show_full_analysis(keyword_text, url, keyword_embedding, url_embs, score)
     else:
-        st.warning("Please generate both keyword and URL embeddings first.")
+        st.write("No similarity scores saved yet.")
