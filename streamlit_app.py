@@ -225,7 +225,7 @@ def check_and_migrate_database():
 check_and_migrate_database()
 
 # Streamlit app
-st.title("Embedding Generator")
+st.title("VectorRank")
 
 # Create tabs
 tab1, tab2, tab3, tab4 = st.tabs(["Generate Embedding", "URL Content Embeddings", "Manage Database", "Compare Embeddings"])
