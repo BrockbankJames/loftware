@@ -12,6 +12,13 @@ import os
 import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 from collections import Counter
+from nltk.tokenize import sent_tokenize, word_tokenize
+import nltk
+
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 
 # We'll use scipy for cosine similarity
 from scipy.spatial.distance import cosine
@@ -110,13 +117,15 @@ def calculate_seo_weighted_embedding(embeddings_array, sections, keyword_text):
 ###############################################################################
 def scrape_and_split_content(url):
     """
-    Scrape the given URL and return a list of content sections.
-    Each section is a dict:
+    Scrape the given URL and return a list of content sections with hierarchical structure.
+    Each section is a dict with:
         {
             "title": <human-readable label>,
             "content": <the extracted text>,
             "tag_type": <HTML tag or type>,
-            "html": <the original HTML of the element>
+            "html": <the original HTML>,
+            "level": <hierarchical level>,
+            "parent_header": <parent header text>
         }
     """
     try:
@@ -132,12 +141,13 @@ def scrape_and_split_content(url):
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Remove unwanted elements - removed 'header' from this list
+        # Remove unwanted elements
         for element in soup(['script', 'style', 'nav', 'footer', 'form', 'button']):
             element.decompose()
         
         sections = []
         seen_content = set()
+        current_headers = {'h1': None, 'h2': None, 'h3': None, 'h4': None, 'h5': None, 'h6': None}
         
         # Identify main content area
         main_content = (
@@ -146,58 +156,95 @@ def scrape_and_split_content(url):
         )
         
         if not main_content:
-            return sections  # No main content found
+            return sections
         
-        # 1) Headings (H1 - H6)
-        for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-            for element in main_content.find_all(tag):
-                text = ' '.join(element.stripped_strings)
-                if text and len(text) > 5 and text not in seen_content:
-                    sections.append({
-                        "title": f"{tag.upper()}: {text}",
-                        "content": text,
-                        "tag_type": tag.upper(),
-                        "html": str(element)
-                    })
-                    seen_content.add(text)
-        
-        # 2) Paragraphs (P)
-        for element in main_content.find_all('p'):
+        # Process all content elements in order
+        for element in main_content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div']):
+            tag = element.name
             text = ' '.join(element.stripped_strings)
-            if text and len(text) > 5 and text not in seen_content:
+            
+            # Skip empty or very short content
+            if not text or len(text) <= 5 or text in seen_content:
+                continue
+                
+            # Handle headers
+            if tag.startswith('h'):
+                level = int(tag[1])
+                # Update current header at this level
+                current_headers[tag] = text
+                # Clear all lower-level headers
+                for i in range(level + 1, 7):
+                    current_headers[f'h{i}'] = None
+                
+                sections.append({
+                    "title": f"{tag.upper()}: {text}",
+                    "content": text,
+                    "tag_type": tag.upper(),
+                    "html": str(element),
+                    "level": level,
+                    "parent_header": current_headers.get(f'h{level-1}') if level > 1 else None
+                })
+                seen_content.add(text)
+            
+            # Handle paragraphs
+            elif tag == 'p':
+                # Find the closest parent header
+                parent_header = None
+                parent_level = None
+                for i in range(1, 7):
+                    if current_headers[f'h{i}']:
+                        parent_header = current_headers[f'h{i}']
+                        parent_level = i
+                        break
+                
                 sections.append({
                     "title": f"P: {text[:50]}...",
                     "content": text,
                     "tag_type": "P",
-                    "html": str(element)
+                    "html": str(element),
+                    "level": parent_level + 1 if parent_level else 7,  # If no parent header, put at bottom
+                    "parent_header": parent_header
                 })
                 seen_content.add(text)
+            
+            # Handle divs (only those without nested p or h tags)
+            elif tag == 'div':
+                # Skip if this <div> has nested <p> or <h>
+                if element.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                    continue
+                
+                div_text_list = []
+                for content in element.contents:
+                    if content.name not in ['p','h1','h2','h3','h4','h5','h6'] and content.string:
+                        clean_text = content.string.strip()
+                        if clean_text:
+                            div_text_list.append(clean_text)
+                    elif isinstance(content, str) and content.strip():
+                        div_text_list.append(content.strip())
+                
+                final_text = ' '.join(div_text_list)
+                if final_text and len(final_text) > 5 and final_text not in seen_content:
+                    # Find closest parent header
+                    parent_header = None
+                    parent_level = None
+                    for i in range(1, 7):
+                        if current_headers[f'h{i}']:
+                            parent_header = current_headers[f'h{i}']
+                            parent_level = i
+                            break
+                    
+                    sections.append({
+                        "title": f"DIV: {final_text[:50]}...",
+                        "content": final_text,
+                        "tag_type": "DIV",
+                        "html": str(element),
+                        "level": parent_level + 1 if parent_level else 7,
+                        "parent_header": parent_header
+                    })
+                    seen_content.add(final_text)
         
-        # 3) DIV-only text (that doesn't contain <p> or <h>)
-        for div in main_content.find_all('div'):
-            # Skip if this <div> has nested <p> or <h>
-            has_p_or_h = div.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-            if has_p_or_h:
-                continue
-            
-            div_text_list = []
-            for content in div.contents:
-                if content.name not in ['p','h1','h2','h3','h4','h5','h6'] and content.string:
-                    clean_text = content.string.strip()
-                    if clean_text:
-                        div_text_list.append(clean_text)
-                elif isinstance(content, str) and content.strip():
-                    div_text_list.append(content.strip())
-            
-            final_text = ' '.join(div_text_list)
-            if final_text and len(final_text) > 5 and final_text not in seen_content:
-                sections.append({
-                    "title": f"DIV: {final_text[:50]}...",
-                    "content": final_text,
-                    "tag_type": "DIV",
-                    "html": str(div)
-                })
-                seen_content.add(final_text)
+        # Sort sections by their hierarchical level
+        sections.sort(key=lambda x: (x.get('level', 7), sections.index(x)))
         
         return sections
     
@@ -336,6 +383,278 @@ def get_embeddings_by_type(embedding_type):
     conn.close()
     return [(row[0], pickle.loads(row[1]), row[2], row[3]) for row in results]
 
+def calculate_hierarchical_embedding(sections):
+    """
+    Calculate embeddings using hierarchical structure
+    
+    Structure:
+    - H1 (weight: 1.5)
+        - H2 (weight: 1.3)
+            - H3 (weight: 1.2)
+                - Paragraphs (weight: 1.0)
+    """
+    
+    def get_tag_weight(tag_type):
+        weights = {
+            'H1': 1.5,
+            'H2': 1.3,
+            'H3': 1.2,
+            'P': 1.0
+        }
+        return weights.get(tag_type.upper(), 1.0)
+
+    # Group sections by their hierarchical level
+    hierarchy = {}
+    current_h1 = None
+    current_h2 = None
+    current_h3 = None
+
+    for section in sections:
+        tag_type = section['tag_type'].upper()
+        embedding = section['embedding']
+        
+        if tag_type == 'H1':
+            current_h1 = embedding
+            current_h2 = None
+            current_h3 = None
+            if 'H1' not in hierarchy:
+                hierarchy['H1'] = []
+            hierarchy['H1'].append(embedding)
+            
+        elif tag_type == 'H2':
+            current_h2 = embedding
+            current_h3 = None
+            if 'H2' not in hierarchy:
+                hierarchy['H2'] = []
+            hierarchy['H2'].append(embedding)
+            
+        elif tag_type == 'H3':
+            current_h3 = embedding
+            if 'H3' not in hierarchy:
+                hierarchy['H3'] = []
+            hierarchy['H3'].append(embedding)
+            
+        elif tag_type == 'P':
+            # Associate paragraph with its nearest header
+            if 'P' not in hierarchy:
+                hierarchy['P'] = []
+            hierarchy['P'].append({
+                'embedding': embedding,
+                'h1': current_h1,
+                'h2': current_h2,
+                'h3': current_h3
+            })
+
+    # Calculate weighted averages at each level
+    final_embedding = np.zeros_like(sections[0]['embedding'])
+    total_weight = 0
+
+    # Process headers
+    for tag_type in ['H1', 'H2', 'H3']:
+        if tag_type in hierarchy and hierarchy[tag_type]:
+            weight = get_tag_weight(tag_type)
+            level_embedding = np.mean([emb for emb in hierarchy[tag_type]], axis=0)
+            final_embedding += level_embedding * weight
+            total_weight += weight
+
+    # Process paragraphs with their hierarchical context
+    if 'P' in hierarchy and hierarchy['P']:
+        p_weight = get_tag_weight('P')
+        p_embeddings = []
+        
+        for p in hierarchy['P']:
+            p_emb = p['embedding']
+            context_emb = p_emb
+            
+            # Add contextual influence from headers
+            if p['h3'] is not None:
+                context_emb = (context_emb + p['h3'] * 0.2)
+            if p['h2'] is not None:
+                context_emb = (context_emb + p['h2'] * 0.3)
+            if p['h1'] is not None:
+                context_emb = (context_emb + p['h1'] * 0.5)
+                
+            p_embeddings.append(context_emb)
+        
+        if p_embeddings:
+            p_final = np.mean(p_embeddings, axis=0)
+            final_embedding += p_final * p_weight
+            total_weight += p_weight
+
+    # Normalize
+    if total_weight > 0:
+        final_embedding /= total_weight
+
+    return final_embedding
+
+def advanced_similarity_analysis(keyword, sections, keyword_embedding, settings):
+    """
+    Comprehensive similarity analysis using hierarchical structure
+    """
+    try:
+        # Convert sections to proper format
+        formatted_sections = [
+            {
+                'tag_type': section['tag_type'],
+                'embedding': section['embedding'],
+                'content': section['content']
+            }
+            for section in sections
+        ]
+        
+        # Calculate hierarchical embedding
+        hierarchical_embedding = calculate_hierarchical_embedding(formatted_sections)
+        
+        # Calculate base similarity with hierarchical embedding
+        base_sim = cosine_similarity(keyword_embedding, hierarchical_embedding)
+        
+        # Rest of your similarity calculations...
+        # [Previous code for context and structural similarity]
+        
+        return base_sim, {
+            'base_similarity': base_sim,
+            'hierarchical_embedding': hierarchical_embedding
+        }
+        
+    except Exception as e:
+        print(f"Advanced analysis error: {e}")
+        return 0.0, {'base_similarity': 0.0}
+
+###############################################################################
+# Advanced Similarity Analysis Functions
+###############################################################################
+
+def calculate_context_weighted_similarity(keyword_embedding, section_embedding, section_content, keyword):
+    """Enhanced similarity with context awareness"""
+    base_similarity = cosine_similarity(keyword_embedding, section_embedding)
+    multipliers = 1.0
+    
+    # Title/heading importance
+    if any(tag in section_content.lower() for tag in ['<h1>', '<h2>', '<h3>']):
+        multipliers *= 1.2
+    
+    # Keyword proximity
+    keyword_terms = set(keyword.lower().split())
+    try:
+        sentences = sent_tokenize(section_content.lower())
+        
+        for sentence in sentences:
+            words = word_tokenize(sentence)
+            for i, word in enumerate(words):
+                if word in keyword_terms:
+                    context_window = words[max(0, i-5):min(len(words), i+6)]
+                    other_terms = keyword_terms - {word}
+                    if any(term in context_window for term in other_terms):
+                        multipliers *= 1.1
+                        break
+    except Exception as e:
+        print(f"Error in tokenization: {e}")
+    
+    return base_similarity * multipliers
+
+def structural_similarity(keyword_embedding, section_embeddings, section_positions):
+    """Calculate similarity with position-based weighting"""
+    num_sections = len(section_embeddings)
+    if num_sections == 0:
+        return 0.0
+        
+    # Position weights decay exponentially
+    position_weights = np.exp(-0.5 * np.array(section_positions) / num_sections)
+    
+    # Calculate weighted similarities
+    similarities = []
+    for emb, weight in zip(section_embeddings, position_weights):
+        sim = cosine_similarity(keyword_embedding, emb) * weight
+        similarities.append(sim)
+    
+    return np.mean(similarities)
+
+def keyword_density_analysis(content, keyword):
+    """Analyze keyword density and placement"""
+    try:
+        words = word_tokenize(content.lower())
+        keyword_terms = set(keyword.lower().split())
+        
+        # Count keyword occurrences
+        total_words = len(words)
+        keyword_count = sum(1 for word in words if word in keyword_terms)
+        
+        if total_words == 0:
+            return 0.0
+            
+        density = keyword_count / total_words
+        return min(density * 5, 1.0)  # Cap at 1.0
+    except:
+        return 0.0
+
+def advanced_similarity_analysis(keyword, sections, keyword_embedding, settings):
+    """
+    Comprehensive similarity analysis combining multiple approaches
+    """
+    try:
+        # Prepare section data
+        section_embeddings = [section['embedding'] for section in sections]
+        section_contents = [section['content'] for section in sections]
+        
+        # 1. Base cosine similarity
+        base_similarities = [
+            cosine_similarity(keyword_embedding, emb) 
+            for emb in section_embeddings
+        ]
+        base_sim = np.mean(base_similarities)
+        
+        # Get weights from settings or use defaults
+        weights = settings.get('weights', {
+            'base': 0.4,
+            'context': 0.3,
+            'structural': 0.15,
+            'keyword_density': 0.15
+        })
+        
+        final_score = 0.0
+        
+        # 2. Context-aware similarity
+        if settings.get('use_context_weighting', True):
+            context_similarities = [
+                calculate_context_weighted_similarity(
+                    keyword_embedding, emb, content, keyword
+                )
+                for emb, content in zip(section_embeddings, section_contents)
+            ]
+            final_score += weights['context'] * np.mean(context_similarities)
+        else:
+            weights['base'] += weights['context']
+        
+        # 3. Structural similarity
+        struct_sim = structural_similarity(
+            keyword_embedding,
+            section_embeddings,
+            range(len(section_embeddings))
+        )
+        final_score += weights['structural'] * struct_sim
+        
+        # 4. Keyword density
+        density_scores = [
+            keyword_density_analysis(content, keyword)
+            for content in section_contents
+        ]
+        density_score = np.mean(density_scores)
+        final_score += weights['keyword_density'] * density_score
+        
+        # Add weighted base similarity
+        final_score += weights['base'] * base_sim
+        
+        return final_score, {
+            'base_similarity': base_sim,
+            'context_similarity': np.mean(context_similarities) if settings.get('use_context_weighting') else None,
+            'structural_similarity': struct_sim,
+            'keyword_density': density_score
+        }
+        
+    except Exception as e:
+        print(f"Advanced analysis error: {e}")
+        return base_sim, {'base_similarity': base_sim}
+
 ###############################################################################
 # 5. Detailed Section Analysis
 ###############################################################################
@@ -457,10 +776,93 @@ with tab2:
     st.write("Enter a URL to generate embeddings for its content sections.")
     url = st.text_input("Enter URL:")
     
+    # Add the custom exclusion settings
+    with st.expander("Advanced Scraping Settings"):
+        # Default exclusions
+        default_exclusions = ['script', 'style', 'nav', 'footer', 'form', 'button']
+        st.write("Default excluded elements:", ", ".join(default_exclusions))
+        
+        # Custom class exclusions
+        custom_classes = st.text_input(
+            "Exclude CSS classes (separate by commas):",
+            help="Example: sidebar, menu-wrapper, advertisement"
+        )
+        
+        # Custom ID exclusions
+        custom_ids = st.text_input(
+            "Exclude element IDs (separate by commas):",
+            help="Example: sidebar, comments-section, related-posts"
+        )
+        
+        # Preview button
+        if st.button("Preview Exclusions"):
+            if url:
+                try:
+                    response = requests.get(url)
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Find elements that would be excluded
+                    excluded_elements = []
+                    
+                    # Check classes
+                    if custom_classes:
+                        for class_name in custom_classes.split(','):
+                            class_name = class_name.strip()
+                            elements = soup.find_all(class_=class_name)
+                            for elem in elements:
+                                excluded_elements.append({
+                                    'type': 'class',
+                                    'name': class_name,
+                                    'content': elem.get_text()[:100] + '...' if len(elem.get_text()) > 100 else elem.get_text()
+                                })
+                    
+                    # Check IDs
+                    if custom_ids:
+                        for id_name in custom_ids.split(','):
+                            id_name = id_name.strip()
+                            element = soup.find(id=id_name)
+                            if element:
+                                excluded_elements.append({
+                                    'type': 'id',
+                                    'name': id_name,
+                                    'content': element.get_text()[:100] + '...' if len(element.get_text()) > 100 else element.get_text()
+                                })
+                    
+                    if excluded_elements:
+                        st.write("### Elements that will be excluded:")
+                        for elem in excluded_elements:
+                            st.write(f"**{elem['type'].upper()}:** {elem['name']}")
+                            st.write(f"Content preview: {elem['content']}")
+                    else:
+                        st.write("No elements found matching the exclusion criteria.")
+                        
+                except Exception as e:
+                    st.error(f"Error previewing exclusions: {str(e)}")
+            else:
+                st.warning("Please enter a URL first.")
+    
     if st.button("Scrape and Generate Embeddings"):
         if url:
             try:
-                sections = scrape_and_split_content(url)
+                # Get custom exclusions from inputs
+                classes_to_exclude = custom_classes if custom_classes else ""
+                ids_to_exclude = custom_ids if custom_ids else ""
+                
+                # Show what's being excluded
+                if classes_to_exclude or ids_to_exclude:
+                    st.write("### Excluding from scrape:")
+                    if classes_to_exclude:
+                        st.write("**Classes:**", classes_to_exclude)
+                    if ids_to_exclude:
+                        st.write("**IDs:**", ids_to_exclude)
+                
+                # Call scraping function with exclusions
+                sections = scrape_and_split_content(
+                    url,
+                    custom_classes=classes_to_exclude,
+                    custom_ids=ids_to_exclude
+                )
+                
                 if sections:
                     st.success(f"Found {len(sections)} content sections!")
                     
@@ -468,56 +870,121 @@ with tab2:
                     st.session_state.current_sections = sections
                     st.session_state.current_url = url
                     
-                    # Store section contents
+                    # Store section contents and generate embeddings
                     st.session_state.section_contents = {}
-                    for section in sections:
-                        url_keyword = f"{section['title']} (URL: {url})"
-                        st.session_state.section_contents[url_keyword] = section['content']
-                    
-                    # Generate SBERT embeddings for each chunk
                     all_embeddings = []
+                    
+                    # Group sections by their hierarchical level
+                    hierarchy = {'H1': [], 'H2': [], 'H3': [], 'H4': [], 'H5': [], 'H6': [], 'P': [], 'DIV': []}
+                    
+                    # Calculate hierarchical embedding
+                    sections_with_embeddings = []
                     for section in sections:
+                        # Generate embedding for this section
                         emb = sbert_model.encode(section['content'])
+                        
+                        sections_with_embeddings.append({
+                            'tag_type': section['tag_type'],
+                            'embedding': emb,
+                            'content': section['content'],
+                            'level': section.get('level', 7),
+                            'parent_header': section.get('parent_header')
+                        })
+                        
+                        # Store in appropriate hierarchy level
+                        tag_type = section['tag_type']
+                        hierarchy[tag_type].append({
+                            'content': section['content'],
+                            'embedding': emb,
+                            'parent_header': section.get('parent_header'),
+                            'level': section.get('level', 7)
+                        })
+                        
+                        # Store for display and later use
+                        url_keyword = f"{tag_type}: {section['title']} (URL: {url})"
+                        st.session_state.section_contents[url_keyword] = {
+                            'content': section['content'],
+                            'tag_type': tag_type,
+                            'parent_header': section.get('parent_header'),
+                            'level': section.get('level', 7)
+                        }
                         all_embeddings.append(emb)
                     
+                    # Calculate final hierarchical embedding
+                    hierarchical_emb = calculate_hierarchical_embedding(sections_with_embeddings)
                     st.session_state.current_embeddings = all_embeddings
                     
-                    # Display each section
-                    for i, (section, embedding) in enumerate(zip(sections, all_embeddings)):
-                        with st.expander(f"Section {i+1}: {section['title']}"):
-                            st.write("Content:")
-                            st.write(section['content'])
-                            st.write("Embedding generated with SBERT!")
+                    # Display sections in hierarchical order
+                    st.write("### Content Structure")
+                    
+                    # Display H1 headers and their children
+                    for h1_section in hierarchy['H1']:
+                        with st.expander(f"📑 H1: {h1_section['content'][:100]}..."):
+                            st.write(h1_section['content'])
+                            st.write("Embedding generated!")
                             
-                            url_keyword = f"{section['title']} (URL: {url})"
+                            # Find and display children
+                            for tag in ['H2', 'H3', 'H4', 'H5', 'H6', 'P', 'DIV']:
+                                children = [
+                                    s for s in hierarchy[tag] 
+                                    if s['parent_header'] == h1_section['content']
+                                ]
+                                for child in children:
+                                    with st.expander(f"{tag}: {child['content'][:100]}..."):
+                                        st.write(child['content'])
+                                        st.write("Embedding generated!")
+                    
+                    # Display orphaned sections (no H1 parent)
+                    orphaned = []
+                    for tag in ['H2', 'H3', 'H4', 'H5', 'H6', 'P', 'DIV']:
+                        orphaned.extend([
+                            s for s in hierarchy[tag]
+                            if not s['parent_header']
+                        ])
+                    
+                    if orphaned:
+                        st.write("### Other Content")
+                        for section in orphaned:
+                            with st.expander(f"📄 {section['content'][:100]}..."):
+                                st.write(section['content'])
+                                st.write("Embedding generated!")
+                    
+                    # Save to database button
+                    if st.button("Save All Sections to Database"):
+                        try:
+                            # Save hierarchical embedding first
+                            save_to_sqlite(
+                                f"HIERARCHICAL_EMBEDDING (URL: {url})",
+                                hierarchical_emb,
+                                content="Hierarchical embedding of all content",
+                                embedding_type="url"
+                            )
                             
-                            if st.button("Save to Database", key=f"save_{i}"):
-                                try:
-                                    save_to_sqlite(url_keyword, embedding, content=section['content'], embedding_type="url")
-                                    st.success(f"Successfully saved section {i+1} to database!")
-                                except Exception as save_error:
-                                    st.error(f"Error saving to database: {save_error}")
-                            
-                            st.write(f"Embedding length: {len(embedding)}")
+                            # Save individual sections
+                            for section in sections:
+                                url_keyword = f"{section['tag_type']}: {section['title']} (URL: {url})"
+                                emb = sbert_model.encode(section['content'])
+                                save_to_sqlite(
+                                    url_keyword,
+                                    emb,
+                                    content=section['content'],
+                                    embedding_type="url",
+                                    metadata=json.dumps({
+                                        'tag_type': section['tag_type'],
+                                        'parent_header': section.get('parent_header'),
+                                        'level': section.get('level', 7)
+                                    })
+                                )
+                            st.success("All sections saved successfully!")
+                            st.rerun()
+                        except Exception as save_error:
+                            st.error(f"Error saving sections: {save_error}")
                 else:
                     st.warning("No content sections found on the page.")
             except Exception as e:
-                st.error(f"Error processing URL: {e}")
+                st.error(f"Error processing URL: {str(e)}")
         else:
             st.warning("Please enter a URL.")
-
-    # Save All Sections to Database
-    if 'current_sections' in st.session_state and 'current_embeddings' in st.session_state:
-        if st.button("Save All Sections to Database", key="save_all"):
-            try:
-                for section, embedding in zip(st.session_state.current_sections, 
-                                           st.session_state.current_embeddings):
-                    url_keyword = f"{section['title']} (URL: {st.session_state.current_url})"
-                    save_to_sqlite(url_keyword, embedding, content=section['content'], embedding_type="url")
-                st.success("All sections saved successfully!")
-                st.rerun()
-            except Exception as save_all_error:
-                st.error(f"Error saving all sections: {save_all_error}")
 
     # Display saved embeddings grouped by URL
     st.subheader("Saved URL Embeddings")
@@ -526,26 +993,33 @@ with tab2:
         
         # Group by URL
         url_groups = {}
-        for keyword_, embedding_, _, timestamp_ in url_embeddings:
+        for keyword_, embedding_, content_, timestamp_ in url_embeddings:
             url_part = keyword_.split("URL: ")[-1].strip(")")
             if url_part not in url_groups:
                 url_groups[url_part] = []
-            url_groups[url_part].append((keyword_, embedding_, timestamp_))
-        
-        st.write(f"Found embeddings for {len(url_groups)} URLs")
+            url_groups[url_part].append((keyword_, embedding_, content_, timestamp_))
         
         if url_groups:
             for url_, sections_ in url_groups.items():
                 with st.expander(f"🌐 {url_}"):
                     st.write(f"Number of sections: {len(sections_)}")
                     
-                    # Show section titles
+                    # Show hierarchical view
                     if st.checkbox("Show sections", key=f"show_sections_{url_}"):
+                        # Group sections by tag type
+                        sections_by_type = {'H1': [], 'H2': [], 'H3': [], 'H4': [], 'H5': [], 'H6': [], 'P': [], 'DIV': []}
                         for section_info in sections_:
-                            section_title = section_info[0].split(" (URL:")[0]
-                            st.write(f"- {section_title}")
+                            tag_type = section_info[0].split(":")[0].strip()
+                            sections_by_type[tag_type].append(section_info)
+                        
+                        # Display in hierarchical order
+                        for tag in ['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'DIV']:
+                            if sections_by_type[tag]:
+                                for section in sections_by_type[tag]:
+                                    section_title = section[0].split(" (URL:")[0]
+                                    st.write(f"- {section_title}")
                     
-                    # Delete all sections for this URL
+                    # Delete URL button
                     if st.button("Delete URL", key=f"delete_url_{url_}"):
                         for section_info in sections_:
                             delete_from_sqlite(section_info[0])
@@ -732,79 +1206,129 @@ with tab3:
 
 # ---------------- Tab 4: Settings ----------------
 with tab4:
-    st.subheader("Manage Saved Embeddings")
+    tab4_1, tab4_2 = st.tabs(["Manage Embeddings", "Analysis Settings"])
     
-    embedding_type_filter = st.selectbox("Show embeddings of type:", ["All", "Keyword", "URL"])
-    if embedding_type_filter == "All":
-        saved_embeddings = get_all_embeddings()
-    else:
-        saved_embeddings = get_embeddings_by_type(embedding_type_filter.lower())
+    # Tab 4.1: Manage Embeddings
+    with tab4_1:
+        st.subheader("Manage Saved Embeddings")
+        
+        embedding_type_filter = st.selectbox("Show embeddings of type:", ["All", "Keyword", "URL"])
+        if embedding_type_filter == "All":
+            saved_embeddings = get_all_embeddings()
+        else:
+            saved_embeddings = get_embeddings_by_type(embedding_type_filter.lower())
 
-    if saved_embeddings:
-        sort_by = st.selectbox("Sort embeddings by:", 
-                               ["Keyword (A-Z)", "Keyword (Z-A)", "Date (Newest)", "Date (Oldest)"])
-        
-        if sort_by == "Keyword (A-Z)":
-            saved_embeddings.sort(key=lambda x: x[0].lower())
-        elif sort_by == "Keyword (Z-A)":
-            saved_embeddings.sort(key=lambda x: x[0].lower(), reverse=True)
-        elif sort_by == "Date (Newest)":
-            saved_embeddings.sort(key=lambda x: x[3], reverse=True)
-        else:  # Date (Oldest)
-            saved_embeddings.sort(key=lambda x: x[3])
-        
-        search = st.text_input("Search keywords:", "")
-        filtered_embeddings = [emb for emb in saved_embeddings if search.lower() in emb[0].lower()]
-        
-        st.write(f"Showing {len(filtered_embeddings)} embeddings")
-        
-        if st.button("Delete All Embeddings"):
-            if st.session_state.get('confirm_delete_all', False):
-                delete_all_embeddings()
-                st.session_state.confirm_delete_all = False
-                st.rerun()
-            else:
-                st.session_state.confirm_delete_all = True
-                st.warning("Click again to confirm deleting all embeddings")
-        
-        for keyword_, embedding_, emb_type_, timestamp_ in filtered_embeddings:
-            with st.expander(f"📌 {keyword_} ({emb_type_})"):
-                st.write(f"**Created:** {timestamp_}")
-                st.code(str(embedding_), language='python')
-                
-                col1, col2, col3 = st.columns([2, 2, 1])
-                with col1:
-                    df = pd.DataFrame([embedding_])
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv,
-                        file_name=f"{keyword_}_embedding.csv",
-                        mime="text/csv",
-                        key=f"csv_{keyword_}"
-                    )
-                with col2:
-                    # Safely convert embedding_ to a JSON-serializable type
-                    if hasattr(embedding_, "tolist"):
-                        embedding_data = embedding_.tolist()
-                    else:
-                        embedding_data = embedding_
+        if saved_embeddings:
+            sort_by = st.selectbox("Sort embeddings by:", 
+                                   ["Keyword (A-Z)", "Keyword (Z-A)", "Date (Newest)", "Date (Oldest)"])
+            
+            if sort_by == "Keyword (A-Z)":
+                saved_embeddings.sort(key=lambda x: x[0].lower())
+            elif sort_by == "Keyword (Z-A)":
+                saved_embeddings.sort(key=lambda x: x[0].lower(), reverse=True)
+            elif sort_by == "Date (Newest)":
+                saved_embeddings.sort(key=lambda x: x[3], reverse=True)
+            else:  # Date (Oldest)
+                saved_embeddings.sort(key=lambda x: x[3])
+            
+            search = st.text_input("Search keywords:", "")
+            filtered_embeddings = [emb for emb in saved_embeddings if search.lower() in emb[0].lower()]
+            
+            st.write(f"Showing {len(filtered_embeddings)} embeddings")
+            
+            if st.button("Delete All Embeddings"):
+                if st.session_state.get('confirm_delete_all', False):
+                    delete_all_embeddings()
+                    st.session_state.confirm_delete_all = False
+                    st.rerun()
+                else:
+                    st.session_state.confirm_delete_all = True
+                    st.warning("Click again to confirm deleting all embeddings")
+            
+            for keyword_, embedding_, emb_type_, timestamp_ in filtered_embeddings:
+                with st.expander(f"📌 {keyword_} ({emb_type_})"):
+                    st.write(f"**Created:** {timestamp_}")
+                    st.code(str(embedding_), language='python')
                     
-                    json_data = json.dumps({
-                        "keyword": keyword_,
-                        "embedding": embedding_data
-                    })
-                    
-                    st.download_button(
-                        label="Download JSON",
-                        data=json_data,
-                        file_name=f"{keyword_}_embedding.json",
-                        mime="application/json",
-                        key=f"json_{keyword_}"
-                    )
-                with col3:
-                    if st.button("Delete", key=f"delete_{keyword_}"):
-                        delete_from_sqlite(keyword_)
-                        st.rerun()
-    else:
-        st.write("No embeddings saved yet.")
+                    col1, col2, col3 = st.columns([2, 2, 1])
+                    with col1:
+                        df = pd.DataFrame([embedding_])
+                        csv = df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="Download CSV",
+                            data=csv,
+                            file_name=f"{keyword_}_embedding.csv",
+                            mime="text/csv",
+                            key=f"csv_{keyword_}"
+                        )
+                    with col2:
+                        # Safely convert embedding_ to a JSON-serializable type
+                        if hasattr(embedding_, "tolist"):
+                            embedding_data = embedding_.tolist()
+                        else:
+                            embedding_data = embedding_
+                        
+                        json_data = json.dumps({
+                            "keyword": keyword_,
+                            "embedding": embedding_data
+                        })
+                        
+                        st.download_button(
+                            label="Download JSON",
+                            data=json_data,
+                            file_name=f"{keyword_}_embedding.json",
+                            mime="application/json",
+                            key=f"json_{keyword_}"
+                        )
+                    with col3:
+                        if st.button("Delete", key=f"delete_{keyword_}"):
+                            delete_from_sqlite(keyword_)
+                            st.rerun()
+        else:
+            st.write("No embeddings saved yet.")
+    
+    # Tab 4.2: Analysis Settings
+    with tab4_2:
+        st.subheader("Analysis Settings")
+        
+        # Analysis settings
+        st.write("### Similarity Analysis Settings")
+        
+        analysis_settings = {
+            "use_context_weighting": st.checkbox("Use Context Weighting", value=True,
+                help="Consider keyword proximity and HTML structure"),
+            
+            "use_topic_analysis": st.checkbox("Use Topic Analysis", value=True,
+                help="Analyze topic distribution in content"),
+            
+            "num_topics": st.slider("Number of Topics", 3, 10, 5,
+                help="Number of topics for topic modeling"),
+            
+            "position_weight": st.slider("Position Importance", 0.0, 1.0, 0.3,
+                help="Weight of section position in similarity calculation")
+        }
+        
+        # Weight adjustments
+        st.write("### Similarity Weight Adjustments")
+        weights = {
+            "base": st.slider("Base Similarity Weight", 0.0, 1.0, 0.4, 0.05),
+            "context": st.slider("Context Weight", 0.0, 1.0, 0.3, 0.05),
+            "topic": st.slider("Topic Weight", 0.0, 1.0, 0.15, 0.05),
+            "structural": st.slider("Structural Weight", 0.0, 1.0, 0.15, 0.05)
+        }
+        
+        # Normalize weights to sum to 1
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v/total for k, v in weights.items()}
+            analysis_settings['weights'] = weights
+        
+        # Save settings
+        if st.button("Save Analysis Settings"):
+            st.session_state.analysis_settings = analysis_settings
+            st.success("Settings saved successfully!")
+            
+            # Show current weights
+            st.write("### Current Normalized Weights")
+            for weight_type, value in weights.items():
+                st.write(f"**{weight_type.title()}:** {value:.3f}")
